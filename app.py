@@ -3,122 +3,184 @@ import csv
 import ast
 from z3 import *
 
-# --- PAGE CONFIG ---
+# --- CONFIGURATION ---
 st.set_page_config(page_title="Macadamia Doctor", page_icon="🌰")
-st.title(" Macadamia Knowledge Base")
-st.markdown("Select a symptom below to find the mathematically proven treatment.")
+st.title("🌰 Dr. Macadamia")
 
-# --- CACHING ---
-# We use @st.cache_resource so Z3 only loads the data ONCE, not every time you click a button.
+# --- LOAD KNOWLEDGE BASE (Z3 Logic) ---
 @st.cache_resource
-def load_knowledge_base():
-    # 1. SETUP Z3
+def load_kb():
+    # Initialize Z3 Fixedpoint Engine
     fp = Fixedpoint()
     fp.set(engine='datalog')
     Thing = BitVecSort(32)
     
+    # ID Helpers
     str_to_id = {}
     id_to_str = {}
-    id_counter = 1
+    counter = 1
 
     def get_id(text):
-        nonlocal id_counter
+        nonlocal counter
         if not text: return None
-        clean_text = text.strip().strip("'").strip('"')
-        if clean_text not in str_to_id:
-            val = BitVecVal(id_counter, Thing)
-            str_to_id[clean_text] = val
-            id_to_str[id_counter] = clean_text
-            id_counter += 1
-        return str_to_id[clean_text]
+        clean = text.strip().strip("'").strip('"')
+        if clean not in str_to_id:
+            val = BitVecVal(counter, Thing)
+            str_to_id[clean] = val
+            id_to_str[counter] = clean
+            counter += 1
+        return str_to_id[clean]
 
-    def get_name(z3_val):
-        try:
-            return id_to_str.get(z3_val.as_long(), str(z3_val))
-        except:
-            return str(z3_val)
+    def get_name(val):
+        try: return id_to_str.get(val.as_long(), str(val))
+        except: return str(val)
 
-    # 2. DEFINE RELATIONS
-    is_type = Function('is_type', Thing, Thing, BoolSort())
-    caused_by = Function('caused_by', Thing, Thing, BoolSort())
+    # Define Relations
+    # Structure: Disease has Symptom, Treatment treats Disease
     has_symptom = Function('has_symptom', Thing, Thing, BoolSort())
     treated_with = Function('treated_with', Thing, Thing, BoolSort())
-
-    fp.register_relation(is_type)
-    fp.register_relation(caused_by)
+    
     fp.register_relation(has_symptom)
     fp.register_relation(treated_with)
 
-    # 3. LOAD DATA
-    all_symptoms = set() # Keep track of symptoms for the Dropdown menu
+    # Load Data from CSV
+    all_symptoms = set()
+    all_diseases = set() # New: Track diseases for the dropdown
     
     try:
-        with open('macadamia.csv', mode='r', encoding='utf-8-sig') as file:
-            reader = csv.DictReader(file)
+        with open('macadamia.csv', mode='r', encoding='utf-8-sig') as f:
+            reader = csv.DictReader(f)
             for row in reader:
-                subject = get_id(row['name'])
+                disease_name = row['name']
+                disease_id = get_id(disease_name)
+                all_diseases.add(disease_name)
                 
-                if row.get('type'): fp.fact(is_type(subject, get_id(row['type'])))
-                if row.get('causal_agent'): fp.fact(caused_by(subject, get_id(row['causal_agent'])))
-                
+                # Load Symptoms
                 if row.get('symptoms'):
                     try:
-                        for sym in ast.literal_eval(row['symptoms']):
-                            fp.fact(has_symptom(subject, get_id(sym)))
-                            all_symptoms.add(sym) # Add to list for UI
+                        for s in ast.literal_eval(row['symptoms']):
+                            fp.fact(has_symptom(disease_id, get_id(s)))
+                            all_symptoms.add(s)
                     except: pass
-
+                
+                # Load Treatments
                 if row.get('treatments'):
                     try:
-                        for treat in ast.literal_eval(row['treatments']):
-                            fp.fact(treated_with(get_id(treat), subject))
+                        for t in ast.literal_eval(row['treatments']):
+                            fp.fact(treated_with(get_id(t), disease_id))
                     except: pass
     except FileNotFoundError:
-        st.error("CSV File not found!")
-        return None, None, None, None
+        return None, None, None, None, None, None, None, None
 
-    # 4. REGISTER RULES
+    # Define Logic Rules
     t, d, s = Consts('t d s', Thing)
     fp.declare_var(t, d, s)
     
+    # Rule: A Treatment 't' cures Symptom 's' IF 't' treats Disease 'd' AND 'd' has symptom 's'
     cures_symptom = Function('cures_symptom', Thing, Thing, BoolSort())
     fp.register_relation(cures_symptom)
     fp.rule(cures_symptom(t, s), [treated_with(t, d), has_symptom(d, s)])
-    
-    return fp, cures_symptom, get_id, get_name, sorted(list(all_symptoms))
 
-# --- LOAD THE ENGINE ---
-fp, cures_symptom_rel, get_id_fn, get_name_fn, symptoms_list = load_knowledge_base()
+    return fp, has_symptom, treated_with, cures_symptom, get_id, get_name, sorted(list(all_symptoms)), sorted(list(all_diseases)), Thing
 
-if fp:
-    # --- USER INTERFACE ---
-    # Dropdown menu (No more typos!)
-    selected_symptom = st.selectbox("What is the symptom?", symptoms_list)
-    
-    if st.button("Find Treatment"):
-        # --- QUERY LOGIC ---
-        Thing = BitVecSort(32)
-        q = Const('q', Thing)
-        fp.declare_var(q)
-        
-        target_id = get_id_fn(selected_symptom)
-        result = fp.query(cures_symptom_rel(q, target_id))
-        
+# APP LOGIC
+fp, has_symptom_rel, treated_with_rel, cures_symptom_rel, get_id, get_name, symptoms, diseases, ThingType = load_kb()
+
+if not fp:
+    st.error("Error: 'macadamia.csv' file not found.")
+    st.stop()
+
+# Helper to extract clean text from Z3 results
+def parse_results(ans_obj):
+    results = set()
+    def collect(expr):
+        if is_bv_value(expr): results.add(get_name(expr))
+        for child in expr.children(): collect(child)
+    collect(ans_obj)
+    return sorted(list(results))
+
+# USER INTERFACE
+tab1, tab2 = st.tabs(["Symptom Checker", "Disease Lookup"])
+
+# TAB 1: SEARCH BY SYMPTOM
+with tab1:
+    st.header("Diagnose by Symptom")
+    selected_symptom = st.selectbox(
+        "I see this symptom:",
+        symptoms, 
+        index=None, 
+        placeholder="Select a symptom..."
+        )
+
+    if st.button("Diagnose Problem"):
         st.divider()
+        s_id = get_id(selected_symptom)
         
-        if result == sat:
-            st.success(f"Treatments found for: **{selected_symptom}**")
-            ans = fp.get_answer()
-            arg = ans.arg(0)
-            
-            results = []
-            if arg.num_args() > 0:
-                for i in range(arg.num_args()):
-                    results.append(get_name_fn(arg.arg(i)))
-            else:
-                results.append(get_name_fn(arg))
-            
-            for r in results:
-                st.info(f" {r}")
+        # DIAGNOSIS (What disease has this symptom?)
+        d_var = Const('d', ThingType)
+        fp.declare_var(d_var)
+        diag_result = fp.query(has_symptom_rel(d_var, s_id))
+        
+        found_disease = False
+        if diag_result == sat:
+            diseases_found = parse_results(fp.get_answer())
+            for d in diseases_found:
+                st.error(f"**Potential Cause:** {d}")
+                found_disease = True
         else:
-            st.warning("No specific treatment found in the Knowledge Base.")
+            st.warning("Unknown disease.")
+
+        # PRESCRIPTION (What cures this symptom?)
+        if found_disease:
+            t_var = Const('t', ThingType)
+            fp.declare_var(t_var)
+            cure_result = fp.query(cures_symptom_rel(t_var, s_id))
+            
+            if cure_result == sat:
+                treatments = parse_results(fp.get_answer())
+                if treatments:
+                    st.success(f"**Recommended Treatments:** {', '.join(treatments)}")
+                else:
+                    st.info("No specific chemical treatment listed.")
+            else:
+                st.info("No cure found in database.")
+
+# TAB 2: SEARCH BY DISEASE
+with tab2:
+    st.header("Disease Encyclopedia")
+    selected_disease = st.selectbox(
+        "Select a Disease or Pest:",
+        diseases,
+        index=None,
+        placeholder="Select a disease..."
+        )
+    
+    if st.button("Get Info"):
+        st.divider()
+        d_id = get_id(selected_disease)
+        
+        #  SYMPTOMS (Query: has_symptom(SelectedDisease, s))
+        s_var = Const('s', ThingType)
+        fp.declare_var(s_var)
+        sym_result = fp.query(has_symptom_rel(d_id, s_var))
+        
+        st.subheader("Symptoms")
+        if sym_result == sat:
+            found_symptoms = parse_results(fp.get_answer())
+            for sym in found_symptoms:
+                st.markdown(f"- {sym}")
+        else:
+            st.write("No symptoms recorded.")
+
+        # GET TREATMENTS (Query: treated_with(t, SelectedDisease))
+        t_var = Const('t', ThingType)
+        fp.declare_var(t_var)
+        treat_result = fp.query(treated_with_rel(t_var, d_id))
+        
+        st.subheader("Treatments")
+        if treat_result == sat:
+            found_treatments = parse_results(fp.get_answer())
+            for treat in found_treatments:
+                st.success(f"{treat}")
+        else:
+            st.warning("No treatments recorded.")
